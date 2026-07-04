@@ -1,0 +1,63 @@
+# ==================================================================
+# CodeAI-X Backend — Production Dockerfile
+# Multi-stage build: deps -> build -> runtime (small, non-root, PM2)
+# ==================================================================
+
+ARG NODE_VERSION=20-alpine
+
+# ------------------------------------------------------------
+# Stage 1: install dependencies (cached separately from source)
+# ------------------------------------------------------------
+FROM node:${NODE_VERSION} AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+
+# ------------------------------------------------------------
+# Stage 2: build (installs devDependencies, compiles/transpiles)
+# ------------------------------------------------------------
+FROM node:${NODE_VERSION} AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY . .
+RUN npm run build --if-present
+
+# ------------------------------------------------------------
+# Stage 3: runtime — minimal image, non-root user, PM2 process manager
+# ------------------------------------------------------------
+FROM node:${NODE_VERSION} AS runtime
+ARG NODE_ENV=production
+ENV NODE_ENV=${NODE_ENV} \
+    PORT=3000 \
+    NPM_CONFIG_LOGLEVEL=warn
+
+# Security: dedicated non-root user
+RUN addgroup -S codeaix && adduser -S codeaix -G codeaix
+
+# Install PM2 globally (process supervision, zero-downtime reload, clustering)
+RUN npm install -g pm2@latest && npm cache clean --force
+
+WORKDIR /app
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/package.json ./package.json
+COPY ecosystem.config.js ./ecosystem.config.js
+
+# Writable dirs the app needs at runtime
+RUN mkdir -p /app/logs /app/uploads && chown -R codeaix:codeaix /app
+
+USER codeaix
+
+EXPOSE 3000
+
+# Container-level healthcheck mirrors the compose healthcheck so the
+# image is self-describing even outside Compose (e.g. bare `docker run`)
+HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=20s \
+  CMD node -e "require('http').get('http://localhost:3000/healthz', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
+
+# PM2 runtime mode: no daemonization, forwards signals correctly for
+# graceful shutdown inside containers, runs in cluster mode across
+# available CPU cores for horizontal use of a single VPS's resources.
+CMD ["pm2-runtime", "start", "ecosystem.config.js", "--env", "production"]
